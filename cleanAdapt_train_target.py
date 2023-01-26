@@ -6,7 +6,7 @@ import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.autograd import Variable
 from torchvision import transforms
-from kitchens_dataset import EpicMultiModalTestDataset, EpicMultiModalDataset, EpicMultiModalWithPseudoLabels
+from kitchens_dataset import EpicMultiModalTestDataset, EpicMultiModalDataset, EpicMultiModalSrcFreeWithPseudoLabels
 from pytorch_i3d import InceptionI3d
 import videotransforms
 import numpy as np
@@ -22,18 +22,16 @@ class EpicKitchensI3D:
             num_epochs,
             init_lr,
             batch_size,
-            src_labels_path,
             src_domain_id,
             pseudo_type,
-            is_flow=False
+            use_pseudo_segs=False
     ):
         self.num_epochs = num_epochs
         self.src_domain_id = src_domain_id
         self.lr = init_lr
-        self.is_flow = is_flow
         self.batch_size = batch_size
-        self.src_labels_path = src_labels_path
         self.pseudo_type = pseudo_type
+        self.use_pseudo_segs = use_pseudo_segs
         
         # Flow model
         self.flow_model = InceptionI3d(8, in_channels=2)
@@ -46,7 +44,7 @@ class EpicKitchensI3D:
         self.rgb_model.cuda()
         self.rgb_model = nn.DataParallel(self.rgb_model)
         self.rgb_model.load_state_dict(torch.load(f'./trained_models/rgb_mm_{src_domain_id}_train_100_epochs.pt'))
-
+        
         self.flow_optim = optim.SGD(self.flow_model.parameters(), lr=self.lr, momentum=0.9, weight_decay=0.0000001)
         self.rgb_optim = optim.SGD(self.rgb_model.parameters(), lr=self.lr, momentum=0.9, weight_decay=0.0000001)
         self.flow_lr_sched = optim.lr_scheduler.MultiStepLR(self.flow_optim, [10, 20])
@@ -62,7 +60,7 @@ class EpicKitchensI3D:
         ])
         self.ce_loss = nn.CrossEntropyLoss()
 
- 
+
     def test_accuracy(
             self,
             trg_label_path
@@ -110,13 +108,15 @@ class EpicKitchensI3D:
         trg_label_df = load_pickle_data(prev_trg_label_path)
         trg_label_df["pseudo_label"] = np.nan
         trg_label_df["confidence"] = np.nan
+        trg_label_df["rgb_seg_start"] = np.nan
+        trg_label_df["flow_seg_start"] = np.nan
         logging.info("Starting extraction of Baseline Pseudo Labels...")
         baseline_dataset = EpicMultiModalDataset(
             labels_path=prev_trg_label_path,
             transforms=self.train_transforms
         )
         baseline_dataloader = DataLoader(baseline_dataset, batch_size=6, shuffle=False, num_workers=0)
-        for batch_idx, (labels, rgb_inputs, flow_inputs, narration_ids) in enumerate(baseline_dataloader):
+        for batch_idx, (labels, rgb_inputs, flow_inputs, narration_ids, rgb_seg_start, flow_seg_start) in enumerate(baseline_dataloader):
             logging.info(f"Batch Id = {batch_idx}, Labels = {labels}")
             # Flow
             flow_inputs = torch.tensor(flow_inputs).float()
@@ -137,30 +137,39 @@ class EpicKitchensI3D:
             for idx, logit in enumerate(fused_logits):
                 pseudo_label = pseudo_labels[idx].item()
                 confidence = self.ce_loss(logit, pseudo_labels[idx]).item()
-                trg_label_df.loc[trg_label_df["uid"] == int(narration_ids[idx].split("_")[-1]), "pseudo_label"] = pseudo_label
-                trg_label_df.loc[trg_label_df["uid"] == int(narration_ids[idx].split("_")[-1]), "confidence"] = confidence
+                current_uid = int(narration_ids[idx].split("_")[-1])
+                trg_label_df.loc[trg_label_df["uid"] == current_uid, "pseudo_label"] = pseudo_label
+                trg_label_df.loc[trg_label_df["uid"] == current_uid, "confidence"] = confidence
+                trg_label_df.loc[trg_label_df["uid"] == current_uid, "rgb_seg_start"] = rgb_seg_start
+                trg_label_df.loc[trg_label_df["uid"] == current_uid, "flow_seg_start"] = flow_seg_start
         trg_label_df.to_pickle(new_trg_label_path)
         logging.info(f"Extracted Pseudo Labels saved at {new_trg_label_path}")
 
- 
+
     def train_with_pseudos(self, prev_trg_pseudo_labels_path, trg_pseudo_sample_rate):
-        for epoch in range(34, self.num_epochs):
+        for epoch in range(0, self.num_epochs):
             counter = 0
-            train_loss = 0.0
+
+            # Load cleanAdapt pseudo labels
             logging.info(f"Epoch {epoch}")
-            trg_pseudo_labels_path = f"./label_lookup/target_train_pseudo_labels_{epoch}.pkl"
+            trg_pseudo_labels_path = f"./label_lookup/target_pseudos_{self.pseudo_type}_epoch_{epoch}_sample_{int(trg_pseudo_sample_rate*100)}.pkl"
+            logging.info("Extracting cleanAdapt pseudo labels...")
             self.extract_baseline_pseudo_labels(prev_trg_pseudo_labels_path, trg_pseudo_labels_path)
+            
+            # Set model to training state
             self.rgb_model.train()
             self.flow_model.train()
             prev_trg_pseudo_labels_path = trg_pseudo_labels_path
-            train_dataset = EpicMultiModalWithPseudoLabels(
-                self.src_labels_path,
+            logging.info(f"Using labels from {trg_pseudo_labels_path}...")
+
+            # Initialise training data with new, updated pseudo labels
+            train_dataset = EpicMultiModalSrcFreeWithPseudoLabels(
                 trg_pseudo_labels_path,
                 trg_pseudo_sample_rate,
-                transforms=self.train_transforms
+                transforms=self.train_transforms,
+                use_pseudo_segs=self.use_pseudo_segs
             )
-            train_dataloader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=8)
-            logging.info(f"Number of Batches = {len(train_dataloader)}")
+            train_dataloader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=False, num_workers=0)
             self.rgb_optim.zero_grad()
             self.flow_optim.zero_grad()
             logging.info("Beginning training...")
@@ -204,16 +213,17 @@ class EpicKitchensI3D:
                     self.flow_optim.step()
                     self.rgb_optim.zero_grad()
                     self.flow_optim.zero_grad()
+
             self.rgb_lr_sched.step()
             self.flow_lr_sched.step()
-            logging.info(f"Epoch {epoch} training finished")
+            logging.info(f"Epoch {epoch} same single batch training finished")
             logging.info("Evaluating test data")
             self.test_accuracy("./label_lookup/D2_test.pkl")
             logging.info("---------------------------------")
             if epoch  == self.num_epochs-1:
-                self.extract_baseline_pseudo_labels(prev_trg_pseudo_labels_path, "./label_lookup/target_train_pseudo_labels_final.pkl")
-            torch.save(self.flow_model.state_dict(), f"./trained_models/flow_src_n_trg_train_epoch_{epoch}.pt")
-            torch.save(self.rgb_model.state_dict(), f"./trained_models/rgb_src_n_trg_train_epoch_{epoch}.pt")
+                self.extract_baseline_pseudo_labels(prev_trg_pseudo_labels_path, "./label_lookup/target_pseudos_{self.pseudo_type}_epoch_final_sample_{int(trg_pseudo_sample_rate*100)}.pkl")
+            torch.save(self.flow_model.state_dict(), f"./trained_models/flow_{self.pseudo_type}_src_free_epoch_{epoch}_sample_{int(trg_pseudo_sample_rate*100)}.pt")
+            torch.save(self.rgb_model.state_dict(), f"./trained_models/rgb_{self.pseudo_type}_src_free_epoch_{epoch}_sample_{int(trg_pseudo_sample_rate*100)}.pt")
 
 
 def load_pickle_data(path):
@@ -229,14 +239,11 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", action="store", dest="epochs", default="60")
     parser.add_argument("--batch_size", action="store", dest="batch_size", default="8")
     parser.add_argument("--pseudo_sample_rate", action="store", dest="pseudo_sample_rate", default="0.2")
-    parser.add_argument("--pseudo_type", action="store", dest="pseudo_type", default="baseline")
-    parser.add_argument("--flow", action="store_true", dest="is_flow")
-    parser.set_defaults(is_flow=False)
+    parser.add_argument("--pseudo_type", action="store", dest="pseudo_type", default="cleanAdapt")
+    parser.add_argument("--use_pseudo_segs", action="store_true", dest="use_pseudo_segs")
+    parser.set_defaults(use_pseudo_segs=True)
     args = parser.parse_args()
-    if args.is_flow:
-        logging_filename = f"train_{args.trg_domain_id}_flow_logs.log"
-    else:
-        logging_filename = f"train_{args.trg_domain_id}_rgb_logs.log"
+    logging_filename = f"test_single_batch_loss_{args.trg_domain_id}_{args.pseudo_type}.log"
     logging.basicConfig(
         filename=logging_filename,
         filemode='a',
@@ -248,13 +255,12 @@ if __name__ == "__main__":
         num_epochs=int(args.epochs),
         init_lr=0.002,
         batch_size=int(args.batch_size),
-        src_labels_path=f"./label_lookup/{args.src_domain_id}_train.pkl",
         src_domain_id=args.src_domain_id,
         pseudo_type=args.pseudo_type,
-        is_flow=args.is_flow
+        use_pseudo_segs=args.use_pseudo_segs
     )
     logging.info("Evaluating test data on Source Only Model")
-    model.test_accuracy(f"./label_lookup/{trg_domain_id}_test.pkl")
+    model.test_accuracy("./label_lookup/D2_test.pkl")
     model.train_with_pseudos(
         f"./label_lookup/{args.trg_domain_id}_train.pkl",
         float(args.pseudo_sample_rate)

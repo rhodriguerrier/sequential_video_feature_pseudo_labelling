@@ -108,7 +108,7 @@ class EpicMultiModalDataset(Dataset):
         self.narration_ids = []
         self.input_names = []
         for index, row in labels_df.iterrows():
-            rgb_seg_img_names = sample_train_segment(
+            rgb_seg_img_names, rgb_seg_start_frame = sample_train_segment(
                 16,
                 row["start_frame"],
                 row["stop_frame"],
@@ -116,7 +116,7 @@ class EpicMultiModalDataset(Dataset):
                 row["video_id"],
                 is_flow=False
             )
-            flow_seg_img_names = sample_train_segment(
+            flow_seg_img_names, flow_seg_start_frame = sample_train_segment(
                 16,
                 row["start_frame"],
                 row["stop_frame"],
@@ -127,8 +127,8 @@ class EpicMultiModalDataset(Dataset):
             self.labels.append(row["verb_class"])
             self.narration_ids.append(f"{row['video_id']}_{row['uid']}")
             self.input_names.append({
-                "Flow": flow_seg_img_names,
-                "RGB": rgb_seg_img_names
+                "Flow": {"img_names": flow_seg_img_names, "seg_start": flow_seg_start_frame},
+                "RGB": {"img_names": rgb_seg_img_names, "seg_start": rgb_seg_start_frame}
             })
 
     def __len__(self):
@@ -136,14 +136,14 @@ class EpicMultiModalDataset(Dataset):
 
     def __getitem__(self, index):
         # Flow
-        flow_imgs = load_flow_frames(self.input_names[index]["Flow"])
+        flow_imgs = load_flow_frames(self.input_names[index]["Flow"]["img_names"])
         flow_imgs = self.transforms(flow_imgs)
         flow_imgs = video_to_tensor(flow_imgs)
         #RGB
-        rgb_imgs = load_rgb_frames(self.input_names[index]["RGB"])
+        rgb_imgs = load_rgb_frames(self.input_names[index]["RGB"]["img_names"])
         rgb_imgs = self.transforms(rgb_imgs)
         rgb_imgs = video_to_tensor(rgb_imgs)
-        return self.labels[index], rgb_imgs, flow_imgs, self.narration_ids[index]
+        return self.labels[index], rgb_imgs, flow_imgs, self.narration_ids[index], self.input_names[index]["RGB"]["seg_start"], self.input_names["Flow"]["seg_start"]
 
 
 class EpicMultiModalTestDataset(Dataset):
@@ -199,15 +199,13 @@ class EpicMultiModalTestDataset(Dataset):
 
 
 class EpicMultiModalSrcFreeWithPseudoLabels(Dataset):
-    def __init__(self, trg_pseudo_labels_path, trg_pseudo_sample_rate, transforms=None, baseline_rotation_perc=None):
+    def __init__(self, trg_pseudo_labels_path, trg_pseudo_sample_rate, transforms=None, use_pseudo_segs=False):
         trg_labels_df = load_pickle_data(trg_pseudo_labels_path)
         self.transforms = transforms
         self.labels = []
         self.narration_ids = []
         self.input_names = []
-        self.expand_rotation = False
-        if baseline_rotation_perc is not None:
-            self.expand_rotation = True
+        self.use_pseudo_segs = use_pseudo_segs
 
         # Load target frames and labels
         for i in range(8):
@@ -222,7 +220,9 @@ class EpicMultiModalSrcFreeWithPseudoLabels(Dataset):
                     row["stop_frame"],
                     row["participant_id"],
                     row["video_id"],
-                    is_flow=False
+                    is_flow=False,
+                    method="preset" if use_pseudo_segs else "random",
+                    preset_seg_start=int(row["rgb_seg_start"]) if self.use_pseudo_segs else None
                 )
                 flow_seg_img_names = sample_train_segment(
                     16,
@@ -230,7 +230,9 @@ class EpicMultiModalSrcFreeWithPseudoLabels(Dataset):
                     row["stop_frame"],
                     row["participant_id"],
                     row["video_id"],
-                    is_flow=True
+                    is_flow=True,
+                    method="preset" if use_pseudo_segs else "random",
+                    preset_seg_start=int(row["flow_seg_start"]) if self.use_pseudo_segs else None
                 )
                 self.labels.append(int(row["pseudo_label"]))
                 self.narration_ids.append(f"{row['video_id']}_{row['uid']}")
@@ -526,9 +528,18 @@ def load_rgb_frames(rgb_filenames):
 
 
 # Function to return random segment in training clip to match MMSADA training
-def sample_train_segment(temporal_window, start_frame, end_frame, part_id, video_id, is_flow, step=2, method="random"):
+def sample_train_segment(
+        temporal_window,
+        start_frame,
+        end_frame,
+        part_id,
+        video_id,
+        is_flow,
+        step=2,
+        method="random",
+        preset_seg_start=None
+):
     half_frame = int(temporal_window/2)
-    #step = 2
     seg_img_names = []
     segment_start = int(start_frame) + (step*half_frame)
     segment_end = int(end_frame) + 1 - (step*half_frame)
@@ -540,6 +551,8 @@ def sample_train_segment(temporal_window, start_frame, end_frame, part_id, video
         segment_start = half_frame*step+2
     if method == "central":
         centre_frame = int((segment_end - segment_start)/2) + segment_start
+    elif method == "preset" and preset_seg_start is not None:
+        centre_frame = preset_seg_start
     else:
         centre_frame = randint(segment_start, segment_end)
     for i in range(centre_frame-(step*half_frame), centre_frame+(step*half_frame), step):
@@ -550,7 +563,7 @@ def sample_train_segment(temporal_window, start_frame, end_frame, part_id, video
             ])
         else:
             seg_img_names.append(f"./epic_kitchens_data/rgb/{part_id}/{video_id}/frame_{str(i).zfill(10)}.jpg")
-    return seg_img_names
+    return seg_img_names, centre_frame
 
 
 # Function to return 5 equidistant segments to match MMSADA testing regime
