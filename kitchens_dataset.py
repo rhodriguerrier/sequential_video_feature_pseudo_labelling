@@ -198,6 +198,63 @@ class EpicMultiModalTestDataset(Dataset):
         return self.labels[index], rgb_equidist_segs, flow_equidist_segs, self.narration_ids[index]
 
 
+class EpicMultiModalSrcFreeWithPseudoLabels(Dataset):
+    def __init__(self, trg_pseudo_labels_path, trg_pseudo_sample_rate, transforms=None, baseline_rotation_perc=None):
+        trg_labels_df = load_pickle_data(trg_pseudo_labels_path)
+        self.transforms = transforms
+        self.labels = []
+        self.narration_ids = []
+        self.input_names = []
+        self.expand_rotation = False
+        if baseline_rotation_perc is not None:
+            self.expand_rotation = True
+
+        # Load target frames and labels
+        for i in range(8):
+            filtered_df = trg_labels_df[trg_labels_df["pseudo_label"] == i]
+            filtered_df = filtered_df.sort_values("confidence", ascending=True)
+            sample_row_num = int(len(filtered_df.index)*trg_pseudo_sample_rate)
+            filtered_df = filtered_df.head(sample_row_num)
+            for idx, row in filtered_df.iterrows():
+                rgb_seg_img_names = sample_train_segment(
+                    16,
+                    row["start_frame"],
+                    row["stop_frame"],
+                    row["participant_id"],
+                    row["video_id"],
+                    is_flow=False
+                )
+                flow_seg_img_names = sample_train_segment(
+                    16,
+                    row["start_frame"],
+                    row["stop_frame"],
+                    row["participant_id"],
+                    row["video_id"],
+                    is_flow=True
+                )
+                self.labels.append(int(row["pseudo_label"]))
+                self.narration_ids.append(f"{row['video_id']}_{row['uid']}")
+                self.input_names.append({
+                    "Flow": flow_seg_img_names,
+                    "RGB": rgb_seg_img_names
+                })
+        
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        #Flow
+        flow_imgs = load_flow_frames(self.input_names[index]["Flow"])
+        flow_imgs = self.transforms(flow_imgs)
+        flow_imgs = video_to_tensor(flow_imgs)
+        #RGB
+        rgb_imgs = load_rgb_frames(self.input_names[index]["RGB"])
+        rgb_imgs = self.transforms(rgb_imgs)
+        rgb_imgs = video_to_tensor(rgb_imgs)
+        return self.labels[index], rgb_imgs, flow_imgs, self.narration_ids[index]
+
+
+
 class EpicMultiModalWithPseudoLabels(Dataset):
     def __init__(self, src_labels_path, trg_pseudo_labels_path, trg_pseudo_sample_rate, transforms=None):
         src_labels_df = load_pickle_data(src_labels_path)
@@ -274,6 +331,71 @@ class EpicMultiModalWithPseudoLabels(Dataset):
         rgb_imgs = self.transforms(rgb_imgs)
         rgb_imgs = video_to_tensor(rgb_imgs)
         return self.labels[index], rgb_imgs, flow_imgs, self.narration_ids[index]
+
+
+class SequentialMultiModalKitchens(Dataset):
+    def __init__(self, labels_path, class_num, temporal_window=16, step=2, sequential_overlap=4, transforms=None):
+        labels_df = load_pickle_data(labels_path)
+        filtered_df = labels_df[labels_df["verb_class"] == class_num]
+        self.labels = []
+        self.input_names = []
+        self.seq_window_start_ratios = []
+        self.sequential_overlap = sequential_overlap
+        self.transforms = transforms
+        for index, row in filtered_df.iterrows():
+            clip_length = row["stop_frame"] - row["start_frame"]
+            num_windows, total_window_len = get_num_seq_windows(clip_length, temporal_window, self.sequential_overlap)
+            frame_start_numbers = get_start_frame_numbers(
+                row["start_frame"],
+                row["stop_frame"],
+                total_window_len,
+                num_windows,
+                self.sequential_overlap
+            )
+            self.labels.append(f"{row['verb_class']}_{row['uid']}")
+            self.input_names.append({
+                "sequential": {
+                    "Flow": sample_test_sequential_frames(
+                        frame_start_numbers,
+                        temporal_window,
+                        True,
+                        row["participant_id"],
+                        row["video_id"]
+                    ),
+                    "RGB": sample_test_sequential_frames(
+                        frame_start_numbers,
+                        temporal_window,
+                        False,
+                        row["participant_id"],
+                        row["video_id"]
+                    )
+                },
+                "frames": {
+                    "start": row["start_frame"],
+                    "stop": row["stop_frame"]
+                }
+            })
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        flow_seq_window_imgs = []
+        rgb_seq_window_imgs = []
+        # Flow
+        for frame_paths in self.input_names[index]["sequential"]["Flow"]:
+            flow_imgs = load_flow_frames(frame_paths)
+            flow_imgs = self.transforms(flow_imgs)
+            flow_imgs = video_to_tensor(flow_imgs)
+            flow_seq_window_imgs.append(flow_imgs)
+        # RGB
+        for frame_paths in self.input_names[index]["sequential"]["RGB"]:
+            rgb_imgs = load_rgb_frames(frame_paths)
+            rgb_imgs = self.transforms(rgb_imgs)
+            rgb_imgs = video_to_tensor(rgb_imgs)
+            rgb_seq_window_imgs.append(rgb_imgs)
+        return self.labels[index], rgb_seq_window_imgs, flow_seq_window_imgs
+
 
 
 class SequentialClassKitchens(Dataset):
