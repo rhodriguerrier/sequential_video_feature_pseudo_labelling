@@ -19,7 +19,7 @@ class EpicKitchenWithPseudoLabels(Dataset):
 
         # Load source frames and labels
         for idx, row in src_labels_df.iterrows():
-            seg_img_names = sample_train_segment(
+            seg_img_names, start_frame = sample_train_segment(
                 16,
                 row["start_frame"],
                 row["stop_frame"],
@@ -37,7 +37,7 @@ class EpicKitchenWithPseudoLabels(Dataset):
             sample_row_num = int(len(filtered_df.index)*trg_pseudo_sample_rate)
             filtered_df = filtered_df.head(sample_row_num)
             for idx, row in filtered_df.iterrows():
-                seg_img_names = sample_train_segment(
+                seg_img_names, start_frame = sample_train_segment(
                     16,
                     row["start_frame"],
                     row["stop_frame"],
@@ -73,7 +73,7 @@ class EpicKitchensDataset(Dataset):
         self.is_flow = is_flow
         self.input_names = []
         for index, row in labels_df.iterrows():
-            seg_img_names = sample_train_segment(
+            seg_img_names, start_frame = sample_train_segment(
                 16,
                 row["start_frame"],
                 row["stop_frame"],
@@ -101,34 +101,23 @@ class EpicKitchensDataset(Dataset):
 
 
 class EpicMultiModalDataset(Dataset):
-    def __init__(self, labels_path, transforms=None):
+    def __init__(self, labels_path, transforms=None, use_prior_windows=False):
         labels_df = load_pickle_data(labels_path)
         self.transforms = transforms
         self.labels = []
         self.narration_ids = []
-        self.input_names = []
+        self.video_frame_details = []
+        self.use_prior_windows = use_prior_windows
         for index, row in labels_df.iterrows():
-            rgb_seg_img_names, rgb_seg_start_frame = sample_train_segment(
-                16,
-                row["start_frame"],
-                row["stop_frame"],
-                row["participant_id"],
-                row["video_id"],
-                is_flow=False
-            )
-            flow_seg_img_names, flow_seg_start_frame = sample_train_segment(
-                16,
-                row["start_frame"],
-                row["stop_frame"],
-                row["participant_id"],
-                row["video_id"],
-                is_flow=True
-            )
             self.labels.append(row["verb_class"])
             self.narration_ids.append(f"{row['video_id']}_{row['uid']}")
-            self.input_names.append({
-                "Flow": {"img_names": flow_seg_img_names, "seg_start": flow_seg_start_frame},
-                "RGB": {"img_names": rgb_seg_img_names, "seg_start": rgb_seg_start_frame}
+            self.video_frame_details.append({
+                "start_frame": row["start_frame"],
+                "stop_frame": row["stop_frame"],
+                "participant_id": row["participant_id"],
+                "video_id": row["video_id"],
+                "rgb_seg_start": int(row["rgb_seg_start"]),
+                "flow_seg_start": int(row["flow_seg_start"])
             })
 
     def __len__(self):
@@ -136,14 +125,34 @@ class EpicMultiModalDataset(Dataset):
 
     def __getitem__(self, index):
         # Flow
-        flow_imgs = load_flow_frames(self.input_names[index]["Flow"]["img_names"])
+        flow_seg_img_names, flow_seg_start = sample_train_segment(
+            16,
+            self.video_frame_details[index]["start_frame"],
+            self.video_frame_details[index]["stop_frame"],
+            self.video_frame_details[index]["participant_id"],
+            self.video_frame_details[index]["video_id"],
+            is_flow=True,
+            method="preset" if self.use_prior_windows else "random",
+            preset_seg_start=self.video_frame_details[index]["flow_seg_start"] if self.use_prior_windows else None
+        )
+        flow_imgs = load_flow_frames(flow_seg_img_names)
         flow_imgs = self.transforms(flow_imgs)
         flow_imgs = video_to_tensor(flow_imgs)
         #RGB
-        rgb_imgs = load_rgb_frames(self.input_names[index]["RGB"]["img_names"])
+        rgb_seg_img_names, rgb_seg_start = sample_train_segment(
+            16,
+            self.video_frame_details[index]["start_frame"],
+            self.video_frame_details[index]["stop_frame"],
+            self.video_frame_details[index]["participant_id"],
+            self.video_frame_details[index]["video_id"],
+            is_flow=False,
+            method="preset" if self.use_prior_windows else "random",
+            preset_seg_start=self.video_frame_details[index]["rgb_seg_start"] if self.use_prior_windows else None
+        )
+        rgb_imgs = load_rgb_frames(rgb_seg_img_names)
         rgb_imgs = self.transforms(rgb_imgs)
         rgb_imgs = video_to_tensor(rgb_imgs)
-        return self.labels[index], rgb_imgs, flow_imgs, self.narration_ids[index], self.input_names[index]["RGB"]["seg_start"], self.input_names["Flow"]["seg_start"]
+        return self.labels[index], rgb_imgs, flow_imgs, self.narration_ids[index], rgb_seg_start, flow_seg_start
 
 
 class EpicMultiModalTestDataset(Dataset):
@@ -205,6 +214,7 @@ class EpicMultiModalSrcFreeWithPseudoLabels(Dataset):
         self.labels = []
         self.narration_ids = []
         self.input_names = []
+        self.expand_rotation = False
         self.use_pseudo_segs = use_pseudo_segs
 
         # Load target frames and labels
@@ -214,24 +224,24 @@ class EpicMultiModalSrcFreeWithPseudoLabels(Dataset):
             sample_row_num = int(len(filtered_df.index)*trg_pseudo_sample_rate)
             filtered_df = filtered_df.head(sample_row_num)
             for idx, row in filtered_df.iterrows():
-                rgb_seg_img_names = sample_train_segment(
+                rgb_seg_img_names, _ = sample_train_segment(
                     16,
                     row["start_frame"],
                     row["stop_frame"],
                     row["participant_id"],
                     row["video_id"],
                     is_flow=False,
-                    method="preset" if use_pseudo_segs else "random",
+                    method="preset" if self.use_pseudo_segs else "random",
                     preset_seg_start=int(row["rgb_seg_start"]) if self.use_pseudo_segs else None
                 )
-                flow_seg_img_names = sample_train_segment(
+                flow_seg_img_names, _ = sample_train_segment(
                     16,
                     row["start_frame"],
                     row["stop_frame"],
                     row["participant_id"],
                     row["video_id"],
                     is_flow=True,
-                    method="preset" if use_pseudo_segs else "random",
+                    method="preset" if self.use_pseudo_segs else "random",
                     preset_seg_start=int(row["flow_seg_start"]) if self.use_pseudo_segs else None
                 )
                 self.labels.append(int(row["pseudo_label"]))
@@ -268,7 +278,7 @@ class EpicMultiModalWithPseudoLabels(Dataset):
 
         # Load source frames and labels
         for idx, row in src_labels_df.iterrows():
-            rgb_seg_img_names = sample_train_segment(
+            rgb_seg_img_names, rgb_start_frame = sample_train_segment(
                 16,
                 row["start_frame"],
                 row["stop_frame"],
@@ -276,7 +286,7 @@ class EpicMultiModalWithPseudoLabels(Dataset):
                 row["video_id"],
                 is_flow=False
             )
-            flow_seg_img_names = sample_train_segment(
+            flow_seg_img_names, flow_start_frame = sample_train_segment(
                 16,
                 row["start_frame"],
                 row["stop_frame"],
@@ -297,7 +307,7 @@ class EpicMultiModalWithPseudoLabels(Dataset):
             sample_row_num = int(len(filtered_df.index)*trg_pseudo_sample_rate)
             filtered_df = filtered_df.head(sample_row_num)
             for idx, row in filtered_df.iterrows():
-                rgb_seg_img_names = sample_train_segment(
+                rgb_seg_img_names, rgb_start_frame = sample_train_segment(
                     16,
                     row["start_frame"],
                     row["stop_frame"],
@@ -305,7 +315,7 @@ class EpicMultiModalWithPseudoLabels(Dataset):
                     row["video_id"],
                     is_flow=False
                 )
-                flow_seg_img_names = sample_train_segment(
+                flow_seg_img_names, flow_start_frame = sample_train_segment(
                     16,
                     row["start_frame"],
                     row["stop_frame"],
@@ -372,10 +382,7 @@ class SequentialMultiModalKitchens(Dataset):
                         row["video_id"]
                     )
                 },
-                "frames": {
-                    "start": row["start_frame"],
-                    "stop": row["stop_frame"]
-                }
+                "start_frames": frame_start_numbers
             })
 
     def __len__(self):
@@ -384,6 +391,8 @@ class SequentialMultiModalKitchens(Dataset):
     def __getitem__(self, index):
         flow_seq_window_imgs = []
         rgb_seq_window_imgs = []
+        if len(self.input_names[index]["start_frames"]) >= 50:
+            return self.labels[index], self.input_names[index]["sequential"]["RGB"], self.input_names[index]["sequential"]["Flow"], self.input_names[index]["start_frames"], True
         # Flow
         for frame_paths in self.input_names[index]["sequential"]["Flow"]:
             flow_imgs = load_flow_frames(frame_paths)
@@ -396,7 +405,7 @@ class SequentialMultiModalKitchens(Dataset):
             rgb_imgs = self.transforms(rgb_imgs)
             rgb_imgs = video_to_tensor(rgb_imgs)
             rgb_seq_window_imgs.append(rgb_imgs)
-        return self.labels[index], rgb_seq_window_imgs, flow_seq_window_imgs
+        return self.labels[index], rgb_seq_window_imgs, flow_seq_window_imgs, self.input_names[index]["start_frames"], False
 
 
 
@@ -540,6 +549,7 @@ def sample_train_segment(
         preset_seg_start=None
 ):
     half_frame = int(temporal_window/2)
+    #step = 2
     seg_img_names = []
     segment_start = int(start_frame) + (step*half_frame)
     segment_end = int(end_frame) + 1 - (step*half_frame)
